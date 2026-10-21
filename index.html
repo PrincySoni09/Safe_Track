@@ -200,7 +200,7 @@ svg{width:100%;height:170px;display:block;background:#0c1730;border-radius:8px}
  <div class="bot" id="hist">
   <div class="card">
    <h2>Location History</h2>
-   <table><thead><tr><th>Time</th><th>Location</th><th>Speed</th><th>Status</th></tr></thead>
+   <table><thead><tr><th>Location</th><th>Time</th><th>Speed</th><th>Status</th></tr></thead>
    <tbody id="hb"><tr><td colspan="4" style="color:var(--mut)">No points yet</td></tr></tbody></table>
   </div>
   <div class="card"><h2>Recent Route</h2><svg id="rr" viewBox="0 0 300 170"></svg></div>
@@ -358,7 +358,9 @@ function saveCfg(){
   })
  }).catch(()=>toast('Could not save settings to the server.'));
 }
+let cfgLoaded=false;
 async function loadCfg(){
+ if(cfgLoaded)return;cfgLoaded=true;
  try{
   const c=await(await fetch(API+'/api/config')).json();
   (c.zones||[]).forEach(z=>{
@@ -374,7 +376,7 @@ async function loadCfg(){
   if(c.lim)$('lim').value=c.lim;
   if(c.dev)$('dev').value=c.dev;
   renderZones();render();
- }catch(e){console.warn('Could not load geofence configuration:',e)}
+ }catch(e){cfgLoaded=false;console.warn('Could not load geofence configuration:',e)}
 }
 async function loadAlerts(){
  try{
@@ -859,14 +861,18 @@ setInterval(()=>{
 },1000);
 
 renderAlerts();render();renderZones();
-if(location.protocol.startsWith('http')){
- $('url').style.display='';
- $('url').value=location.origin;
- $('src').value=location.search.includes('demo')?'demo':'server';
- API=location.origin;
- loadCfg();loadAlerts();
- if(!location.search.includes('manual'))setTimeout(()=>$('go').click(),400);
-}
+(function boot(){
+ if(!location.protocol.startsWith('http'))return;
+ const q=location.search,manual=q.includes('usb')||q.includes('manual');
+ if(q.includes('usb'))$('src').value='serial';
+ fetch(location.origin+'/api/config').then(r=>{
+  if(!r.ok)throw 0;
+  API=location.origin;loadCfg();loadAlerts();
+  if(!manual){$('url').style.display='';$('url').value=API;$('src').value=q.includes('demo')?'demo':'server'}
+ }).catch(()=>{
+  if(!manual){$('src').value='demo';$('url').style.display='none'}
+ }).then(()=>{if(!manual)setTimeout(()=>$('go').click(),400)});
+})();
 </script>
 </body>
 </html>
