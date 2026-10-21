@@ -138,7 +138,7 @@ svg{width:100%;height:170px;display:block;background:#0c1730;border-radius:8px}
   <option value="serial">USB serial (real board)</option>
   <option value="server">Server URL</option>
  </select>
- <input id="url" placeholder="http://192.168.1.5:3000" style="display:none;width:200px">
+ <input id="url" placeholder="Backend URL (optional for local USB)" style="display:none;width:260px">
  <button id="go" class="pri">Start</button>
  <span><i class="dot" id="cdot"></i><span id="ctext">Not connected</span></span>
  <span style="color:var(--mut)">Last updated: <span id="lu">--</span></span>
@@ -285,6 +285,7 @@ const st={
  lastGood:0,last:0,gpsLost:false,over:false,off:false,sos:false,
  mode:null,dev:false,timer:null,ticks:0,cover:false,simSos:false,
  badN:0,bat:null,rssi:null,link:'--',logT:0,hasFix:null,sats:null,
+ stopped:true,serialPort:null,serialReader:null,serialTask:null,serialPipe:null,
  speed:0,place:'',gl:null,drawPoints:[],drawLine:null,drawMarkers:[]
 };
 
@@ -317,7 +318,7 @@ function zoneStyle(z){
  const color=isBreach?'#ff354f':(z.restr?'#ffad32':'#00ff9d');
  return {
   color,fillColor:color,weight:4,opacity:z.on?1:.4,
-  fillOpacity:z.on?.24:.04,dashArray:z.restr?'8 5':null,
+    fillOpacity:z.on?.24:.04,dashArray:z.restr?'8 5':null,
   lineCap:'round',lineJoin:'round'
  };
 }
@@ -647,7 +648,7 @@ function finishBoundary(){
  z.c.bindPopup('<b>'+escapeHtml(name)+'</b><br>Custom boundary drawn by you.');
  clearBoundaryPreview();st.zones.push(z);setMode(null);
  renderZones();render();saveCfg();toast('Your custom boundary has been saved.');
-}
+ }
 
 /* Generate random polygon coordinates within the visible map. */
 function makeRandomPolygon(){
@@ -767,40 +768,114 @@ $('rep').onclick=e=>{
  a.download='track.csv';a.click();URL.revokeObjectURL(a.href);
 };
 
-/* Parse lines from the tracker serial output. */
+/* Parse lines from the tracker serial output and optionally forward them to the server. */
+function forwardTelemetry(p){
+ if(!API)return;
+ fetch(API+'/api/telemetry',{
+  method:'POST',
+  headers:{'Content-Type':'application/json'},
+  body:JSON.stringify(p)
+ }).catch(e=>console.warn('Could not forward telemetry to server:',e));
+}
 function parseLine(s){
  let m=s.match(/fix=(\d) sats=(\d+) hdop=([\d.]+) lat=(-?[\d.]+) lon=(-?[\d.]+) spd=([\d.]+)/);
  if(m){
-  const b=s.match(/bat=(\d+)/),r=s.match(/rssi=(\d+)/),g=s.match(/ g=([\d.]+)/);
-  ingest({fix:+m[1],sats:+m[2],lat:+m[4],lon:+m[5],spd:+m[6],
-   bat:b?+b[1]:null,rssi:r?+r[1]:null,g:g?+g[1]:null,link:'USB'});
+  const b=s.match(/bat=(\d+)/),r=s.match(/rssi=(-?\d+)/),g=s.match(/ g=([\d.]+)/);
+  const p={fix:+m[1],sats:+m[2],hdop:+m[3],lat:+m[4],lon:+m[5],spd:+m[6],
+   bat:b?+b[1]:null,rssi:r?+r[1]:null,g:g?+g[1]:null,link:'USB'};
+  ingest(p);
+  forwardTelemetry(p);
   return;
  }
  m=s.match(/^CELL lat=(-?[\d.]+) lon=(-?[\d.]+) acc=(\d+)/);
- if(m){showCell(+m[1],+m[2],+m[3]);return}
+ if(m){
+  const p={fix:0,clat:+m[1],clon:+m[2],cacc:+m[3],link:'USB cell'};
+  showCell(p.clat,p.clon,p.cacc);
+  forwardTelemetry(p);
+  return;
+ }
  m=s.match(/^ALERT: (.*)/);
  if(m){
   if(/GPS LOST/i.test(m[1]))st.gpsLost=true;
   if(/GPS RESTORED/i.test(m[1]))st.gpsLost=false;
-  addAlert(/SOS/i.test(m[1])?'sos':/RESTORED|SPEED OK|BACK/i.test(m[1])?'info':'warn',m[1]);return;
+  const type=/SOS/i.test(m[1])?'sos':/RESTORED|SPEED OK|BACK/i.test(m[1])?'info':'warn';
+  addAlert(type,m[1]);
+  forwardTelemetry({alert:m[1],sos:type==='sos',fix:st.hasFix?1:0});
+  return;
  }
- if(/^SMS: SOS/i.test(s))addAlert('sos','SOS button pressed on the tracker. SMS sent.');
+ if(/^SMS: SOS/i.test(s)){
+  addAlert('sos','SOS button pressed on the tracker. SMS sent.');
+  forwardTelemetry({sos:true,fix:st.hasFix?1:0});
+ }
 }
 async function startSerial(){
- if(!('serial' in navigator)){alert('Use Chrome or Edge on a laptop for USB serial.');return false}
+ if(!('serial' in navigator)){
+  alert('Use Chrome or Edge on HTTPS or localhost for USB serial.');
+  return false;
+ }
  try{
-  const port=await navigator.serial.requestPort();await port.open({baudRate:115200});st.dev=true;
-  const dec=new TextDecoderStream();port.readable.pipeTo(dec.writable);
-  const rd=dec.readable.getReader();let buf='';
-  (async()=>{
-   for(;;){
-    const {value,done}=await rd.read();if(done)break;
-    buf+=value;let i;
-    while((i=buf.indexOf('\n'))>=0){parseLine(buf.slice(0,i).trim());buf=buf.slice(i+1)}
+  // Optional backend URL: enter your public tunnel URL to share GPS with other devices.
+  const u=$('url').value.trim().replace(/\/$/,'');
+  API=u;
+  st.serialPort=await navigator.serial.requestPort();
+  await st.serialPort.open({baudRate:115200});
+  st.dev=true;st.mode='serial';st.stopped=false;
+  $('ctext').textContent='USB connected; waiting for GPS';
+  $('cdot').style.background='var(--amb)';
+  $('go').textContent='Stop';
+  $('src').disabled=true;
+  $('url').disabled=true;
+  const decoder=new TextDecoderStream();
+  st.serialPipe=st.serialPort.readable.pipeTo(decoder.writable).catch(()=>{});
+  st.serialReader=decoder.readable.getReader();
+  st.serialTask=(async()=>{
+   let buf='';
+   try{
+    while(!st.stopped&&st.serialReader){
+     const {value,done}=await st.serialReader.read();
+     if(done)break;
+     buf+=value;
+     let i;
+     while((i=buf.indexOf('\n'))>=0){
+      parseLine(buf.slice(0,i).trim());
+      buf=buf.slice(i+1);
+     }
+     if(buf.length>4096)buf='';
+    }
+   }catch(e){
+    if(!st.stopped)console.warn('Serial reader stopped:',e);
    }
   })();
+  toast(API?'LILYGO connected; forwarding GPS to server.':'LILYGO connected; GPS is shown in this browser only.');
   return true;
- }catch(e){alert('Could not open the port. Close Arduino Serial Monitor and try again.\n'+e.message);return false}
+ }catch(e){
+  st.dev=false;
+  st.serialPort=null;
+  alert('Could not open the port. Close Arduino Serial Monitor and try again.\n'+e.message);
+  return false;
+ }
+}
+async function stopTracking(){
+ st.stopped=true;
+ if(st.timer){clearInterval(st.timer);st.timer=null;}
+ const rd=st.serialReader;
+ st.serialReader=null;
+ if(rd){
+  try{await rd.cancel()}catch(e){}
+ }
+ if(st.serialTask){
+  try{await st.serialTask}catch(e){}
+  st.serialTask=null;
+ }
+ if(st.serialPort){
+  const p=st.serialPort;st.serialPort=null;
+  try{if(p.readable)await p.close()}catch(e){}
+ }
+ st.serialPipe=null;st.dev=false;st.mode=null;
+ $('go').textContent='Start';
+ $('src').disabled=false;$('url').disabled=false;
+ $('ctext').textContent='Stopped';$('cdot').style.background='var(--red)';
+ toast('Tracking stopped. Demo will not restart automatically.');
 }
 async function loadHistory(u){
  try{
@@ -817,22 +892,29 @@ async function loadHistory(u){
  }catch(e){}
 }
 function startServer(){
- const u=$('url').value.replace(/\/$/,'');
- if(!u){alert('Enter the server address first.');return false}
- API=u;loadHistory(u);loadCfg();loadAlerts();
+ const u=$('url').value.trim().replace(/\/$/,'');
+ if(!u){alert('Enter the backend server URL first.');return false}
+ API=u;st.mode='server';st.stopped=false;
+ loadHistory(u);loadCfg();loadAlerts();
  st.timer=setInterval(async()=>{
+  if(st.stopped||st.mode!=='server')return;
   try{
-   const j=await(await fetch(u+'/api/live')).json();
+   const j=await(await fetch(u+'/api/live',{cache:'no-store'})).json();
    if(!j.t||j.t===st.srvT)return;st.srvT=j.t;
-   if(j.clat&&!j.fix)showCell(j.clat,j.clon,j.cacc);
-   ingest({fix:j.fix??1,lat:j.lat,lon:j.lon,spd:j.spd,sats:j.sats,
-    sos:j.sos,bat:j.bat,rssi:j.rssi,g:j.g,imp:j.imp,link:j.link||'Server'});
+   if(j.clat!=null&&!j.fix)showCell(j.clat,j.clon,j.cacc);
+   if(j.alert)addAlert(/SOS/i.test(j.alert)?'sos':'warn',j.alert);
+   if(j.fix===1||j.lat!=null){
+    ingest({fix:j.fix??1,lat:j.lat,lon:j.lon,spd:j.spd,sats:j.sats,
+     sos:j.sos,bat:j.bat,rssi:j.rssi,g:j.g,imp:j.imp,link:j.link||'Server'});
+   }
   }catch(e){$('ctext').textContent='Server not reachable'}
- },3000);
+ },2000);
  return true;
 }
 function startDemo(){
+ st.mode='demo';st.stopped=false;
  st.timer=setInterval(()=>{
+  if(st.stopped||st.mode!=='demo')return;
   const t=++st.ticks;
   ingest({fix:st.cover?0:1,sats:st.cover?0:9,
    lat:29.8649+0.0007*Math.sin(t/18),lon:77.8966+0.0011*Math.cos(t/18),
@@ -840,18 +922,32 @@ function startDemo(){
   st.simSos=false;
  },1000);
  addAlert('info','Demo started. You can test custom boundaries and random zones on the map.');
- const b=document.createElement('button');b.textContent='Cover GPS antenna (demo)';
- b.onclick=()=>{st.cover=!st.cover;b.textContent=st.cover?'Uncover GPS antenna':'Cover GPS antenna (demo)'};
- $('hint').after(b);return true;
+ if(!$('coverDemo')){
+  const b=document.createElement('button');b.id='coverDemo';b.textContent='Cover GPS antenna (demo)';
+  b.onclick=()=>{st.cover=!st.cover;b.textContent=st.cover?'Uncover GPS antenna':'Cover GPS antenna (demo)'};
+  $('hint').after(b);
+ }
+ return true;
 }
-$('src').onchange=()=>{$('url').style.display=$('src').value==='server'?'':'none'};
-$('go').onclick=async()=>{
- if(st.timer||st.dev){location.reload();return}
- const s=$('src').value;
- if(s==='server')API=$('url').value.replace(/\/$/,'');
- const ok=s==='demo'?startDemo():s==='serial'?await startSerial():startServer();
- if(ok)$('go').textContent='Stop';
+$('src').onchange=()=>{
+ const mode=$('src').value;
+ $('url').style.display=(mode==='server'||mode==='serial')?'':'none';
+ $('url').placeholder=mode==='serial'?'Public backend URL to share GPS (optional)':'Backend URL, e.g. https://your-tunnel.trycloudflare.com';
 };
+$('go').onclick=async()=>{
+ if(st.timer||st.dev){await stopTracking();return}
+ const s=$('src').value;
+ st.stopped=false;
+ if(s==='demo'){
+  if(startDemo()){$('go').textContent='Stop';$('src').disabled=true}
+ }else if(s==='serial'){
+  const ok=await startSerial();
+  if(ok)$('go').textContent='Stop';
+ }else{
+  if(startServer()){$('go').textContent='Stop';$('src').disabled=true;$('url').disabled=true}
+ }
+};
+
 setInterval(()=>{
  const now=Date.now();
  if(!st.dev&&st.lastGood&&!st.gpsLost&&now-st.lastGood>(st.cover?5000:30000)){
@@ -862,16 +958,9 @@ setInterval(()=>{
 
 renderAlerts();render();renderZones();
 (function boot(){
- if(!location.protocol.startsWith('http'))return;
- const q=location.search,manual=q.includes('usb')||q.includes('manual');
- if(q.includes('usb'))$('src').value='serial';
- fetch(location.origin+'/api/config').then(r=>{
-  if(!r.ok)throw 0;
-  API=location.origin;loadCfg();loadAlerts();
-  if(!manual){$('url').style.display='';$('url').value=API;$('src').value=q.includes('demo')?'demo':'server'}
- }).catch(()=>{
-  if(!manual){$('src').value='demo';$('url').style.display='none'}
- }).then(()=>{if(!manual)setTimeout(()=>$('go').click(),400)});
+ $('url').style.display=($('src').value==='server'||$('src').value==='serial')?'':'none';
+ // Intentionally do not click Start automatically.
+ // The user must explicitly choose a mode and press Start.
 })();
 </script>
 </body>
