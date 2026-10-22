@@ -75,8 +75,8 @@ input[type=number]{width:74px}
 table{width:100%;border-collapse:collapse;font-size:13px}
 th{color:var(--mut);text-align:left;font-weight:400;padding:5px 4px}
 td{padding:6px 4px;border-top:1px solid var(--ln);overflow-wrap:anywhere}
-canvas{width:100%;height:170px;display:block}
-svg{width:100%;height:170px;display:block;background:#0c1730;border-radius:8px}
+#chart{width:100%;height:170px;display:block}
+#rr{width:100%;height:170px;display:block;background:#0c1730;border-radius:8px}
 .zones{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
 .z{background:var(--pan2);border:1px solid var(--ln);border-radius:10px;padding:10px 12px;display:flex;align-items:center;gap:10px}
 .z div{flex:1;min-width:0}
@@ -137,6 +137,7 @@ svg{width:100%;height:170px;display:block;background:#0c1730;border-radius:8px}
   <option value="demo">Demo (simulated)</option>
   <option value="serial">USB serial (real board)</option>
   <option value="server">Server URL</option>
+  <option value="firebase">Firebase (live from cloud)</option>
  </select>
  <input id="url" placeholder="Backend URL (optional for local USB)" style="display:none;width:260px">
  <button id="go" class="pri">Start</button>
@@ -276,16 +277,21 @@ $('tS').onclick=()=>useLayer(2);
 
 const trailLine=L.polyline([],{color:'#3b82f6',weight:4}).addTo(map);
 const routeLine=L.polyline([],{color:'#c4a7ff',weight:4,dashArray:'8 6'}).addTo(map);
-const marker=L.circleMarker([0,0],{
- radius:9,color:'#fff',weight:3,fillColor:'#2f6df6',fillOpacity:1
-}).bindTooltip('Current Location',{permanent:true,direction:'top'});
+
+/* Google-Maps-style red pin for the tracker location. */
+const pinIcon=L.divIcon({
+ className:'',iconSize:[36,46],iconAnchor:[18,46],tooltipAnchor:[0,-40],
+ html:'<svg width="36" height="46" viewBox="0 0 36 46" style="width:36px;height:46px;display:block;background:none"><path d="M18 0C8 0 0 8 0 18c0 13 18 28 18 28s18-15 18-28C36 8 28 0 18 0z" fill="#ea4335" stroke="#fff" stroke-width="2"/><circle cx="18" cy="18" r="7" fill="#fff"/></svg>'
+});
+const marker=L.marker([0,0],{icon:pinIcon,zIndexOffset:1000})
+ .bindTooltip('Current Location',{permanent:true,direction:'top',offset:[0,-4]});
 
 const st={
  trail:[],speeds:[],log:[],zones:[],route:[],alerts:[],showAll:false,
  lastGood:0,last:0,gpsLost:false,over:false,off:false,sos:false,
  mode:null,dev:false,timer:null,ticks:0,cover:false,simSos:false,
  badN:0,bat:null,rssi:null,link:'--',logT:0,hasFix:null,sats:null,
- stopped:true,serialPort:null,serialReader:null,serialTask:null,serialPipe:null,
+ tool:null,stopped:true,serialPort:null,serialReader:null,serialTask:null,serialPipe:null,
  speed:0,place:'',gl:null,drawPoints:[],drawLine:null,drawMarkers:[]
 };
 
@@ -318,7 +324,7 @@ function zoneStyle(z){
  const color=isBreach?'#ff354f':(z.restr?'#ffad32':'#00ff9d');
  return {
   color,fillColor:color,weight:4,opacity:z.on?1:.4,
-    fillOpacity:z.on?.24:.04,dashArray:z.restr?'8 5':null,
+  fillOpacity:z.on?.24:.04,dashArray:z.restr?'8 5':null,
   lineCap:'round',lineJoin:'round'
  };
 }
@@ -423,8 +429,8 @@ $('va').onclick=e=>{
 const cellCircle=L.circle([0,0],{
  radius:500,color:'#ffad32',weight:3,fillColor:'#ffad32',fillOpacity:.12
 });
-function showCell(lat,lon,acc){
- if(st.lastGood&&Date.now()-st.lastGood<60000)return;
+function showCell(lat,lon,acc,force){
+ if(!force&&st.lastGood&&Date.now()-st.lastGood<60000)return;
  const first=!map.hasLayer(cellCircle);
  cellCircle.setLatLng([lat,lon]).setRadius(acc||500);
  if(first){cellCircle.addTo(map);map.setView([lat,lon],15)}
@@ -536,12 +542,12 @@ function tip(p){
  marker.setTooltipContent(e);
 }
 function render(){
- const now=Date.now(),on=st.last&&now-st.last<15000,p=st.trail[st.trail.length-1];
+ const now=Date.now(),on=st.last&&now-st.last<(st.hasFix===false?150000:15000),p=st.trail[st.trail.length-1];
  $('onl').textContent=on?'Online':'Offline';$('onl').className='pill'+(on?'':' r');
  $('cdot').style.background=on?'var(--grn)':'var(--red)';
  $('ctext').textContent=on?'Connected':(st.last?'No data':'Not connected');
  $('lu').textContent=st.last?fmt(st.last):'--';$('dLu').textContent=st.last?fmt(st.last):'--';
- if(p){
+ if(p&&st.link!=='Cell tower'){
   const ll=p.lat.toFixed(5)+'°, '+p.lon.toFixed(5)+'°';
   $('cLoc').textContent=st.place||'Live position';$('cLL').textContent=ll;
   $('dLoc').textContent=st.place||ll;tip(p);
@@ -608,8 +614,8 @@ function drawRoute(){
 
 /* Drawing mode controls */
 function setMode(m){
- if(st.mode==='polygon'&&m!=='polygon')clearBoundaryPreview();
- st.mode=m;
+ if(st.tool==='polygon'&&m!=='polygon')clearBoundaryPreview();
+ st.tool=m;
  $('bz').className=m==='zone'?'on':'';
  $('br').className=m==='route'?'on':'';
  $('drawBoundary').className=m==='polygon'?'on':'';
@@ -648,7 +654,7 @@ function finishBoundary(){
  z.c.bindPopup('<b>'+escapeHtml(name)+'</b><br>Custom boundary drawn by you.');
  clearBoundaryPreview();st.zones.push(z);setMode(null);
  renderZones();render();saveCfg();toast('Your custom boundary has been saved.');
- }
+}
 
 /* Generate random polygon coordinates within the visible map. */
 function makeRandomPolygon(){
@@ -696,13 +702,13 @@ $('qS').onclick=()=>{
 
 /* Click handling: circular zone, custom polygon, route, or map lookup. */
 map.on('click',e=>{
- if(st.mode==='zone'){
+ if(st.tool==='zone'){
   const r=Math.max(1,+$('rad').value||50),restr=$('restr').checked;
   const name=(restr?'Restricted Zone ':'Safe Zone ')+(st.zones.length+1);
   const z={name,lat:e.latlng.lat,lon:e.latlng.lng,r,restr,type:'circle',in:null,votes:0,on:true,test:false};
   z.c=makeZoneLayer(z);st.zones.push(z);
   renderZones();render();saveCfg();toast(name+' added.');
- }else if(st.mode==='polygon'){
+ }else if(st.tool==='polygon'){
   st.drawPoints.push(e.latlng);
   st.drawMarkers.push(L.circleMarker(e.latlng,{
    radius:6,color:'#ffffff',weight:2,fillColor:'#38bdf8',fillOpacity:1,
@@ -714,7 +720,7 @@ map.on('click',e=>{
   st.drawMarkers.forEach(m=>m.bringToFront());
   $('finishBoundary').disabled=st.drawPoints.length<3;
   $('hint').textContent=st.drawPoints.length+' points added. Click Finish boundary when the outline is complete.';
- }else if(st.mode==='route'){
+ }else if(st.tool==='route'){
   st.route.push({lat:e.latlng.lat,lon:e.latlng.lng});
   routeLine.setLatLngs(st.route.map(p=>[p.lat,p.lon]));render();saveCfg();
  }else identify(e.latlng);
@@ -770,6 +776,12 @@ $('rep').onclick=e=>{
 
 /* Parse lines from the tracker serial output and optionally forward them to the server. */
 function forwardTelemetry(p){
+ if(window.fb&&window.fb.ready&&window.fb.uploadFromUsb){
+  window.fb.send(p).catch(e=>{
+   console.warn('Firebase upload failed:',e);
+   if(!forwardTelemetry.warned){forwardTelemetry.warned=true;toast('Firebase upload failed: '+(e.code||e.message))}
+  });
+ }
  if(!API)return;
  fetch(API+'/api/telemetry',{
   method:'POST',
@@ -798,7 +810,7 @@ function parseLine(s){
  if(m){
   if(/GPS LOST/i.test(m[1]))st.gpsLost=true;
   if(/GPS RESTORED/i.test(m[1]))st.gpsLost=false;
-  const type=/SOS/i.test(m[1])?'sos':/RESTORED|SPEED OK|BACK/i.test(m[1])?'info':'warn';
+  const type=/SOS/i.test(m[1])?'sos':/RESTORED|SPEED OK|BACK|FIX OK|ENTERED|CANCELLED/i.test(m[1])?'info':'warn';
   addAlert(type,m[1]);
   forwardTelemetry({alert:m[1],sos:type==='sos',fix:st.hasFix?1:0});
   return;
@@ -818,7 +830,16 @@ async function startSerial(){
   const u=$('url').value.trim().replace(/\/$/,'');
   API=u;
   st.serialPort=await navigator.serial.requestPort();
-  await st.serialPort.open({baudRate:115200});
+  try{
+   await st.serialPort.open({baudRate:115200});
+  }catch(e){
+   // Port was left open by an earlier session on this page: reuse it if it is free.
+   if(e.name==='InvalidStateError'&&st.serialPort.readable&&!st.serialPort.readable.locked){
+    console.warn('Port already open, reusing it');
+   }else if(e.name==='InvalidStateError'){
+    throw new Error('Port is stuck open from a previous session. Refresh this page (Ctrl+F5) and try again.');
+   }else throw e;
+  }
   st.dev=true;st.mode='serial';st.stopped=false;
   $('ctext').textContent='USB connected; waiting for GPS';
   $('cdot').style.background='var(--amb)';
@@ -850,7 +871,9 @@ async function startSerial(){
   return true;
  }catch(e){
   st.dev=false;
-  st.serialPort=null;
+  if(st.serialReader){try{await st.serialReader.cancel()}catch(_){} st.serialReader=null;}
+  if(st.serialPipe){try{await st.serialPipe}catch(_){} st.serialPipe=null;}
+  if(st.serialPort){try{await st.serialPort.close()}catch(_){} st.serialPort=null;}
   alert('Could not open the port. Close Arduino Serial Monitor and try again.\n'+e.message);
   return false;
  }
@@ -858,6 +881,7 @@ async function startSerial(){
 async function stopTracking(){
  st.stopped=true;
  if(st.timer){clearInterval(st.timer);st.timer=null;}
+ if(st.fbUnsub){try{st.fbUnsub()}catch(e){} st.fbUnsub=null;}
  const rd=st.serialReader;
  st.serialReader=null;
  if(rd){
@@ -867,19 +891,23 @@ async function stopTracking(){
   try{await st.serialTask}catch(e){}
   st.serialTask=null;
  }
+ if(st.serialPipe){
+  try{await st.serialPipe}catch(e){}
+  st.serialPipe=null;
+ }
  if(st.serialPort){
   const p=st.serialPort;st.serialPort=null;
-  try{if(p.readable)await p.close()}catch(e){}
+  try{await p.close()}catch(e){console.warn('Port close failed:',e)}
  }
- st.serialPipe=null;st.dev=false;st.mode=null;
+ st.dev=false;st.mode=null;
  $('go').textContent='Start';
  $('src').disabled=false;$('url').disabled=false;
  $('ctext').textContent='Stopped';$('cdot').style.background='var(--red)';
  toast('Tracking stopped. Demo will not restart automatically.');
 }
-async function loadHistory(u){
+async function loadHistory(u,preloaded){
  try{
-  const h=await(await fetch(u+'/api/history')).json();
+  const h=preloaded||await(await fetch(u+'/api/history')).json();
   h.forEach(j=>{
    if(j.fix&&j.lat){
     const pt={lat:j.lat,lon:j.lon,spd:j.spd||0,t:j.t};
@@ -911,6 +939,41 @@ function startServer(){
  },2000);
  return true;
 }
+function startFirebase(){
+ if(!window.fb||!window.fb.ready){
+  alert('Firebase is not set up yet. Open index.html, paste your Firebase config into FIREBASE_CONFIG, and reload.');
+  return false;
+ }
+ API='';st.mode='firebase';st.stopped=false;st.fbLiveT=0;st.fbCellT=0;
+ window.fb.history(300).then(h=>{if(h.length)loadHistory('',h)}).catch(e=>console.warn('Firebase history failed:',e));
+ st.fbUnsub=window.fb.listen(
+  v=>{
+   if(st.stopped)return;
+   if(v.fix===1&&Number.isFinite(v.lat)&&Number.isFinite(v.lon)){
+    if(st.fbCellT&&v.t&&st.fbCellT>v.t)return;   // a newer cell-tower position exists
+    ingest({fix:1,lat:v.lat,lon:v.lon,spd:v.spd,sats:v.sats,sos:v.sos,
+     bat:v.bat,rssi:v.rssi,g:v.g,link:'Firebase'});
+    if(v.t){st.last=v.t;st.lastGood=v.t;st.fbLiveT=v.t}
+   }
+  },
+  e=>{
+   if(st.stopped)return;
+   const text=e.alert||'SOS button pressed on the tracker.';
+   const type=e.sos?'sos':/RESTORED|SPEED OK|BACK|FIX OK|ENTERED|CANCELLED/i.test(text)?'info':'warn';
+   addAlert(type,text);
+  },
+  cv=>{
+   if(st.stopped)return;
+   if(!Number.isFinite(cv.clat)||!Number.isFinite(cv.clon))return;
+   if(cv.t&&st.fbLiveT&&cv.t<=st.fbLiveT)return;   // GPS data is newer
+   if(cv.t){st.fbCellT=cv.t;st.last=cv.t}
+   st.hasFix=false;st.sats=null;st.link='Cell tower';
+   showCell(cv.clat,cv.clon,cv.cacc,true);
+  }
+ );
+ $('ctext').textContent='Listening to Firebase';
+ return true;
+}
 function startDemo(){
  st.mode='demo';st.stopped=false;
  st.timer=setInterval(()=>{
@@ -935,7 +998,7 @@ $('src').onchange=()=>{
  $('url').placeholder=mode==='serial'?'Public backend URL to share GPS (optional)':'Backend URL, e.g. https://your-tunnel.trycloudflare.com';
 };
 $('go').onclick=async()=>{
- if(st.timer||st.dev){await stopTracking();return}
+ if(st.timer||st.dev||st.fbUnsub){await stopTracking();return}
  const s=$('src').value;
  st.stopped=false;
  if(s==='demo'){
@@ -943,6 +1006,8 @@ $('go').onclick=async()=>{
  }else if(s==='serial'){
   const ok=await startSerial();
   if(ok)$('go').textContent='Stop';
+ }else if(s==='firebase'){
+  if(startFirebase()){$('go').textContent='Stop';$('src').disabled=true}
  }else{
   if(startServer()){$('go').textContent='Stop';$('src').disabled=true;$('url').disabled=true}
  }
@@ -962,6 +1027,88 @@ renderAlerts();render();renderZones();
  // Intentionally do not click Start automatically.
  // The user must explicitly choose a mode and press Start.
 })();
+</script>
+<script type="module">
+/* ============ FIREBASE SETUP ============
+   1. Firebase console > Project settings > Your apps > Web app > copy the config.
+   2. Paste the values below (databaseURL is shown after you create a Realtime Database).
+   Until the values are filled in, Firebase stays switched off and everything else works as before. */
+const FIREBASE_CONFIG={
+ apiKey:"AIzaSyC3JQxPFufKNqFHuCDtKjuwhL62Bq0AJc8",
+ authDomain:"safetrack-47933.firebaseapp.com",
+ databaseURL:"https://safetrack-47933-default-rtdb.asia-southeast1.firebasedatabase.app",
+ projectId:"safetrack-47933",
+ appId:"1:25347086938:web:11f7e4b188859eb6a21663"
+};
+const DEVICE_ID='trk_k8f3q92xz7d1m6';       // use a different id per tracker
+const HISTORY_EVERY_MS=5000;      // how often a point is saved to history (only used if UPLOAD_FROM_USB is true)
+const UPLOAD_FROM_USB=false;      // false = the Arduino uploads to Firebase itself; the page only reads
+
+window.fb={ready:false};
+if(FIREBASE_CONFIG.apiKey&&!FIREBASE_CONFIG.apiKey.startsWith('YOUR_')){
+ try{
+  const {initializeApp}=await import('https://www.gstatic.com/firebasejs/12.7.0/firebase-app.js');
+  const {getAuth,signInAnonymously}=await import('https://www.gstatic.com/firebasejs/12.7.0/firebase-auth.js');
+  const {getDatabase,ref,set,push:dbPush,get,query,limitToLast,onValue,onChildAdded}=
+   await import('https://www.gstatic.com/firebasejs/12.7.0/firebase-database.js');
+
+  const app=initializeApp(FIREBASE_CONFIG);
+  const db=getDatabase(app);
+  const authP=signInAnonymously(getAuth(app)).catch(e=>{
+   console.warn('Firebase anonymous sign-in failed (continuing without auth):',e.code||e.message);
+  });
+  const base='devices/'+DEVICE_ID;
+  let lastHist=0,firstOk=true;
+  const clean=o=>JSON.parse(JSON.stringify(o)); // drops undefined values, which Firebase rejects
+
+  window.fb={
+   ready:true,
+   uploadFromUsb:UPLOAD_FROM_USB,
+   /* Upload one telemetry object from the tracker. */
+   async send(p){
+    await authP;
+    const t=Date.now();
+    if(p.fix===1&&Number.isFinite(p.lat)&&Number.isFinite(p.lon)){
+     await set(ref(db,base+'/live'),clean({...p,t}));
+     if(t-lastHist>=HISTORY_EVERY_MS||p.sos){
+      lastHist=t;
+      await dbPush(ref(db,base+'/history'),clean({lat:p.lat,lon:p.lon,spd:p.spd||0,fix:1,sos:!!p.sos,t}));
+     }
+    }else if(p.clat!=null){
+     await set(ref(db,base+'/cell'),clean({...p,t}));
+    }else if(p.alert||p.sos){
+     await dbPush(ref(db,base+'/events'),clean({alert:p.alert||null,sos:!!p.sos,t}));
+    }
+    if(firstOk){firstOk=false;window.toast&&window.toast('Uploading GPS to Firebase')}
+   },
+   /* Last saved points, oldest first. */
+   async history(n){
+    await authP;
+    const snap=await get(query(ref(db,base+'/history'),limitToLast(n||300)));
+    const out=[];snap.forEach(c=>{out.push(c.val())});
+    return out;
+   },
+   /* Subscribe to live position and alert events. Returns an unsubscribe function. */
+   listen(onLive,onEvent,onCell){
+    let off=[],dead=false;
+    authP.then(()=>{
+     if(dead)return;
+     const fail=e=>{console.warn('Firebase read failed:',e);window.toast&&window.toast('Firebase read failed: '+(e.code||e.message))};
+     off.push(onValue(ref(db,base+'/live'),s=>{const v=s.val();if(v)onLive(v)},fail));
+     off.push(onValue(ref(db,base+'/cell'),s=>{const v=s.val();if(v&&onCell)onCell(v)},fail));
+     const t0=Date.now();
+     off.push(onChildAdded(query(ref(db,base+'/events'),limitToLast(1)),s=>{
+      const v=s.val();if(v&&v.t>t0-30000)onEvent(v);
+     },fail));
+    });
+    return ()=>{dead=true;off.forEach(f=>f());off=[]};
+   }
+  };
+ }catch(e){
+  console.error('Firebase failed to start:',e);
+  window.fb={ready:false};
+ }
+}
 </script>
 </body>
 </html>
