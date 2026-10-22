@@ -76,12 +76,12 @@ const server = http.createServer((req, res) => {
 
   // Dashboard HTML served by this server.
   if (req.method === 'GET' && (pathname === '/' || pathname === '/index.html')) {
-    return fs.readFile(path.join(DATA_DIR, 'safetrack_dashboard.html'), (err, html) => {
+    return fs.readFile(path.join(DATA_DIR, 'index.html'), (err, html) => {
       if (err) {
         return send(
           res,
           404,
-          'safetrack_dashboard.html must be in the same folder as server.js',
+          'index.html must be in the same folder as server.js',
           'text/plain'
         );
       }
