@@ -1,5 +1,5 @@
 // SafeTrack server. Run: node server.js
-// Keep this file next to safetrack_dashboard.html. No npm install is needed.
+// Keep this file next to index.html. No npm install is needed.
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
